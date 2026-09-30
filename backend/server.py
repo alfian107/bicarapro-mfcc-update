@@ -181,6 +181,9 @@ class AnalysisDetail(AnalysisSummary):
     rms_mean: float
     zcr_mean: float
     spectral_centroid_mean: float
+    mfcc_pipeline: Optional[dict] = None
+    viz: Optional[dict] = None
+    score_breakdown: Optional[dict] = None
 
 
 class Material(BaseModel):
@@ -301,6 +304,141 @@ def _ffmpeg_to_wav(src_path: str) -> str:
         raise
 
 
+def _build_mfcc_display(y: np.ndarray, sr: int, mfcc: np.ndarray, scoring: dict) -> dict:
+    """Build MFCC pipeline-stage values, visualization arrays and score formulas.
+
+    Replicates librosa's MFCC chain (n_fft=2048, hop=512, Hann window,
+    n_mels=128, power_to_db, DCT-II ortho) so displayed intermediates match the
+    coefficients actually used for scoring.
+    """
+    def f4(v):
+        return float(round(float(v), 4))
+
+    def stats(a):
+        a = np.asarray(a, dtype=float)
+        return {"min": f4(a.min()), "max": f4(a.max()), "mean": f4(a.mean())}
+
+    def sample(a, n=8):
+        return [f4(v) for v in np.asarray(a, dtype=float).ravel()[:n]]
+
+    n_fft, hop, n_mels = 2048, 512, 128
+    n_frames = int(mfcc.shape[1])
+    mid = n_frames // 2
+
+    y_pre = librosa.effects.preemphasis(y, coef=0.97)
+    S_power = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop, window="hann")) ** 2
+    window = np.hanning(n_fft)
+    mel_basis = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
+    mel_spec = mel_basis @ S_power
+    log_mel = librosa.power_to_db(mel_spec)
+
+    stages = [
+        {"key": "pre_emphasis", "name": "1. Pre-emphasis",
+         "desc": "Filter orde-1 yang menekankan frekuensi tinggi agar spektrum seimbang.",
+         "params": {"Rumus": "y[n] = x[n] − α·x[n−1]", "Koefisien α": "0.97",
+                    "Jumlah sampel": int(y.size)},
+         "stats": stats(y_pre), "sample": sample(y_pre)},
+        {"key": "framing", "name": "2. Framing",
+         "desc": "Sinyal dipotong menjadi frame pendek (quasi-stasioner) yang tumpang-tindih.",
+         "params": {"Ukuran frame": f"{n_fft} sampel ({n_fft / sr * 1000:.1f} ms)",
+                    "Hop length": f"{hop} sampel ({hop / sr * 1000:.1f} ms)",
+                    "Jumlah frame": n_frames},
+         "stats": None, "sample": None},
+        {"key": "windowing", "name": "3. Windowing",
+         "desc": "Setiap frame dikalikan jendela Hann untuk mengurangi kebocoran spektral.",
+         "params": {"Jenis jendela": "Hann", "Rumus": "w[n] = 0.5·(1 − cos(2πn/(N−1)))",
+                    "Ukuran jendela": n_fft},
+         "stats": stats(window), "sample": sample(window)},
+        {"key": "fft", "name": "4. FFT",
+         "desc": "Transformasi Fourier mengubah frame ke domain frekuensi (spektrum daya).",
+         "params": {"n_fft": n_fft, "Bin frekuensi": f"1025 (0–{sr // 2} Hz)",
+                    "Resolusi": f"{sr / n_fft:.2f} Hz/bin"},
+         "stats": stats(S_power), "sample": sample(S_power[:, mid])},
+        {"key": "mel_filterbank", "name": "5. Mel Filterbank",
+         "desc": "Spektrum dipetakan ke skala Mel (mendekati persepsi pendengaran manusia).",
+         "params": {"Jumlah filter": n_mels, "Rentang frekuensi": f"0 – {sr // 2} Hz",
+                    "Rumus Mel": "m = 2595·log10(1 + f/700)"},
+         "stats": stats(mel_spec), "sample": sample(mel_spec[:, mid])},
+        {"key": "log", "name": "6. Logaritma",
+         "desc": "Energi Mel dikonversi ke desibel agar sesuai persepsi loudness manusia.",
+         "params": {"Fungsi": "10·log10(P)", "Satuan": "dB"},
+         "stats": stats(log_mel), "sample": sample(log_mel[:, mid])},
+        {"key": "dct", "name": "7. DCT",
+         "desc": "Discrete Cosine Transform menghasilkan koefisien MFCC yang terdekorrelasi.",
+         "params": {"Tipe": "DCT-II (norm=ortho)", "Koefisien diambil": 13,
+                    "Total frame": n_frames},
+         "stats": stats(mfcc), "sample": sample(mfcc[:, mid], n=13)},
+    ]
+
+    # Waveform envelope (min/max per bucket)
+    n_buckets = min(400, max(2, int(y.size) // 2))
+    trimmed = y[: (y.size // n_buckets) * n_buckets]
+    blocks = trimmed.reshape(n_buckets, -1)
+    waveform = {"min": [f4(v) for v in blocks.min(axis=1)],
+                "max": [f4(v) for v in blocks.max(axis=1)],
+                "samples": int(y.size), "sr": sr}
+
+    # Average magnitude spectrum in dB, downsampled to <=128 points
+    mag_db = librosa.amplitude_to_db(np.sqrt(S_power.mean(axis=1)), ref=np.max)
+    n_bins = 128
+    step = max(1, mag_db.size // n_bins)
+    spectrum = {"db": [f4(mag_db[i:i + step].max()) for i in range(0, mag_db.size, step)][:n_bins],
+                "fmin": 0.0, "fmax": sr / 2.0}
+
+    # MFCC heatmap, downsampled to <=96 frame columns
+    max_cols = 96
+    m = mfcc
+    if n_frames > max_cols:
+        step_f = n_frames / max_cols
+        m = np.stack([
+            m[:, int(i * step_f): max(int((i + 1) * step_f), int(i * step_f) + 1)].mean(axis=1)
+            for i in range(max_cols)
+        ], axis=1)
+    heatmap = {"rows": 13, "cols": int(m.shape[1]),
+               "values": [[f4(v) for v in row] for row in m],
+               "frame_ms": round(hop / sr * 1000, 1), "total_frames": n_frames}
+
+    rms_s, flat_s, zcr_s = scoring["rms_score"], scoring["flat_score"], scoring["zcr_score"]
+    pitch_std = scoring["pitch_std"]
+    score_breakdown = {
+        "intonation": {
+            "title": "Skor Intonasi",
+            "formula": "skor = 100 − |σ_pitch − 45| × 1.4   (jika σ_pitch = 0 → 40)",
+            "inputs": [
+                {"label": "σ_pitch (variasi pitch)", "value": f"{pitch_std:.2f} Hz"},
+                {"label": "σ ideal (target)", "value": "45 Hz"},
+                {"label": "Faktor penalti", "value": "1.4 per Hz"},
+            ],
+            "substitution": (
+                f"100 − |{pitch_std:.1f} − 45| × 1.4 = {100 - abs(pitch_std - 45) * 1.4:.1f}"
+                if pitch_std != 0 else "σ_pitch = 0 → skor dasar 40"
+            ),
+            "score": round(float(scoring["intonation_score"]), 1),
+        },
+        "clarity": {
+            "title": "Skor Kejelasan",
+            "formula": "skor = (0.45·RMS′ + 0.40·SF′ + 0.15·ZCR′) × 100",
+            "inputs": [
+                {"label": "RMS (energi)", "value": f"{scoring['rms_mean']:.4f}",
+                 "detail": f"RMS′ = min(RMS/0.08, 1) = {rms_s:.3f}"},
+                {"label": "Spectral flatness", "value": f"{scoring['sf_mean']:.4f}",
+                 "detail": f"SF′ = 1 − SF/0.4 = {flat_s:.3f}"},
+                {"label": "Zero crossing rate", "value": f"{scoring['zcr_mean']:.4f}",
+                 "detail": f"ZCR′ = 1 − |ZCR−0.08|/0.15 = {zcr_s:.3f}"},
+            ],
+            "substitution": f"(0.45×{rms_s:.3f} + 0.40×{flat_s:.3f} + 0.15×{zcr_s:.3f}) × 100",
+            "score": round(float(scoring["clarity_score"]), 1),
+        },
+    }
+
+    return {
+        "mfcc_pipeline": {"sample_rate": sr, "duration_seconds": f4(scoring.get("duration", 0)),
+                          "n_mfcc": 13, "stages": stages},
+        "viz": {"waveform": waveform, "spectrum": spectrum, "heatmap": heatmap},
+        "score_breakdown": score_breakdown,
+    }
+
+
 def _extract_mfcc_features(audio_bytes: bytes, filename: str) -> dict:
     """Extract MFCC + related features. Returns dict of feature stats."""
     suffix = Path(filename).suffix or ".wav"
@@ -389,6 +527,16 @@ def _extract_mfcc_features(audio_bytes: bytes, filename: str) -> dict:
 
     overall_score = float(np.round((intonation_score + clarity_score) / 2, 1))
 
+    display = _build_mfcc_display(y, sr, mfcc, {
+        "duration": duration,
+        "pitch_std": pitch_std,
+        "rms_mean": rms_mean, "rms_score": rms_score,
+        "sf_mean": sf_mean, "flat_score": flat_score,
+        "zcr_mean": zcr_mean, "zcr_score": zcr_score,
+        "intonation_score": intonation_score,
+        "clarity_score": clarity_score,
+    })
+
     return {
         "duration_seconds": float(round(duration, 2)),
         "mfcc_mean": [round(v, 3) for v in mfcc_mean],
@@ -402,6 +550,7 @@ def _extract_mfcc_features(audio_bytes: bytes, filename: str) -> dict:
         "intonation_score": round(intonation_score, 1),
         "clarity_score": round(clarity_score, 1),
         "overall_score": overall_score,
+        **display,
     }
 
 

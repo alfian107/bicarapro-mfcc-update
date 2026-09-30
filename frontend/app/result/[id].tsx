@@ -10,6 +10,10 @@ import { useAudioPlayer, useAudioPlayerStatus } from "expo-audio";
 import * as Speech from "expo-speech";
 import { Colors, Spacing, Radius } from "@/src/theme/colors";
 import { api, getAudioSignedUrl } from "@/src/api/client";
+import { ScoreBreakdown } from "@/src/components/mfcc/ScoreBreakdown";
+import { PipelineStages } from "@/src/components/mfcc/PipelineStages";
+import { WaveformChart, SpectrumChart } from "@/src/components/mfcc/SignalCharts";
+import { MfccHeatmap } from "@/src/components/mfcc/MfccHeatmap";
 
 type Analysis = {
   id: string; title: string; user_name: string;
@@ -21,6 +25,9 @@ type Analysis = {
   duration_seconds: number; pitch_mean: number; pitch_std: number;
   rms_mean: number; zcr_mean: number; spectral_centroid_mean: number;
   mfcc_mean: number[]; mfcc_std: number[]; created_at: string;
+  mfcc_pipeline?: { sample_rate: number; duration_seconds: number; stages: any[] } | null;
+  viz?: any | null;
+  score_breakdown?: any | null;
 };
 
 export default function Result() {
@@ -190,6 +197,58 @@ export default function Result() {
             })}
           </View>
         </View>
+
+        {data.score_breakdown && (
+          <View style={styles.section}>
+            <View style={styles.sectionHead}>
+              <Ionicons name="calculator-outline" size={20} color={Colors.brandSecondary} />
+              <Text style={styles.sectionTitle}>Rumus Perhitungan Skor</Text>
+            </View>
+            <ScoreBreakdown data={data.score_breakdown} />
+          </View>
+        )}
+
+        {data.mfcc_pipeline && (
+          <View style={styles.section}>
+            <View style={styles.sectionHead}>
+              <Ionicons name="git-branch-outline" size={20} color={Colors.brandSecondary} />
+              <Text style={styles.sectionTitle}>Tahapan Perhitungan MFCC</Text>
+            </View>
+            <PipelineStages pipeline={data.mfcc_pipeline} />
+          </View>
+        )}
+
+        {data.viz?.waveform && data.viz?.spectrum && (
+          <View style={styles.section}>
+            <View style={styles.sectionHead}>
+              <Ionicons name="pulse-outline" size={20} color={Colors.brandSecondary} />
+              <Text style={styles.sectionTitle}>Visualisasi Sinyal</Text>
+            </View>
+            <WaveformChart data={data.viz.waveform} />
+            <SpectrumChart data={data.viz.spectrum} />
+          </View>
+        )}
+
+        {data.viz?.heatmap && (
+          <View style={styles.section}>
+            <View style={styles.sectionHead}>
+              <Ionicons name="grid-outline" size={20} color={Colors.brandSecondary} />
+              <Text style={styles.sectionTitle}>Heatmap MFCC per Frame</Text>
+            </View>
+            <MfccHeatmap data={data.viz.heatmap} />
+          </View>
+        )}
+
+        {!data.mfcc_pipeline && (
+          <View style={styles.section}>
+            <View style={styles.legacyBox} testID="mfcc-pipeline-legacy-note">
+              <Ionicons name="information-circle-outline" size={16} color={Colors.onSurfaceTertiary} />
+              <Text style={styles.legacyText}>
+                Perhitungan detail MFCC (tahapan, visualisasi, dan rumus skor) tersedia untuk rekaman baru.
+              </Text>
+            </View>
+          </View>
+        )}
 
         <TouchableOpacity
           testID="result-new-recording-btn"
@@ -517,6 +576,12 @@ const styles = StyleSheet.create({
   mfccCol: { flex: 1, alignItems: "center", gap: 4 },
   mfccBar: { width: "70%", borderRadius: 2 },
   mfccIdx: { fontSize: 9, color: Colors.onSurfaceTertiary },
+  legacyBox: {
+    flexDirection: "row", alignItems: "center", gap: Spacing.sm,
+    backgroundColor: Colors.surfaceSecondary, borderRadius: Radius.md,
+    borderColor: Colors.border, borderWidth: 1, padding: Spacing.lg,
+  },
+  legacyText: { flex: 1, fontSize: 12, color: Colors.onSurfaceTertiary, lineHeight: 18 },
   newBtn: {
     marginHorizontal: Spacing.lg, marginTop: Spacing.xxl,
     flexDirection: "row", alignItems: "center", justifyContent: "center", gap: Spacing.sm,
