@@ -1,6 +1,7 @@
 # PRD — BicaraPro
 
 ## Session Log
+- **2026-09-30 (2)**: Fitur **Perhitungan MFCC transparan** — backend `_build_mfcc_display()` mengembalikan `mfcc_pipeline` (7 tahap: Pre-emphasis→Framing→Windowing→FFT→Mel Filterbank→Log→DCT dengan parameter + nilai nyata rekaman), `viz` (waveform envelope 400 titik, spektrum rata-rata 128 bin dB, heatmap MFCC 13×96), `score_breakdown` (rumus + substitusi angka skor Intonasi & Kejelasan). Frontend: 4 komponen baru di `src/components/mfcc/` (ScoreBreakdown, PipelineStages, SignalCharts, MfccHeatmap — react-native-svg) di layar `/result/[id]` (dipakai siswa & guru). Rekaman lama menampilkan catatan info. Tested: 7/7 backend + semua alur frontend (iteration_7).
 - **2026-09-30**: Environment recovery + object-storage migration. Restored missing `backend/.env` & `frontend/.env`; installed backend pip deps (librosa etc.) and frontend `node_modules`; fixed missing `LlmChat`/`UserMessage` imports (crash-loop); **migrated audio uploads from pod-local `uploads/` to Emergent object storage** (`bicarapro/uploads/<user_id>/<file>`, streamed via `GET /api/analyses/{id}/audio` with legacy local fallback); pinned Expo Metro to port 3000 (`expo start --port 3000`). Tested: 37/37 backend pytest + full frontend flows green (iteration_6).
 - **Backlog**: P1 record-flow UI test on a real device/mic; P2 backfill legacy local audio files into object storage; P2 expose `audio_storage_path` in AnalysisDetail if needed; P3 ffmpeg setup-error gating in test_audio_formats.py.
 

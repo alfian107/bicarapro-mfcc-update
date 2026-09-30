@@ -1,0 +1,38 @@
+{
+  "summary": "Verified new MFCC pipeline display feature (mfcc_pipeline, viz, score_breakdown) end-to-end. Backend: 7/7 pytest tests in /app/backend/tests/test_mfcc_pipeline.py PASSED against public preview URL — POST /api/analyses returns all 3 new fields with correct structure (7 pipeline stages pre_emphasis→dct, DCT sample has exactly 13 values, viz.waveform.sr=22050 with matched min/max arrays ≤400, viz.spectrum.db ≤128, viz.heatmap rows=13/cols≤96, score_breakdown.intonation formula contains σ_pitch, clarity formula contains 0.45/0.40/0.15 weights, scores 0..100 rounded to 1 dp). GET /api/analyses/{id} returns identical fields (Mongo round-trip clean, no BSON serialization issues). Legacy analyses (3 pre-feature docs in siswa history: StorageCheck, TEST Analysis, TEST Audio Playback) still return 200 with mfcc_pipeline/viz/score_breakdown absent — no 500s, no regressions. Guru can read a siswa analysis and receives full pipeline payload. Frontend (Expo web): siswa logs in, opens the pipeline-enabled analysis 2d5ad248-... — all 9 testIDs render: score-breakdown-section, score-breakdown-intonation, score-breakdown-clarity, mfcc-pipeline-section, mfcc-stage-mel_filterbank, mfcc-stage-dct, viz-waveform, viz-spectrum, mfcc-heatmap; scores shown rounded (37, 94) not long floats. Legacy analysis 92d32a26-... renders mfcc-pipeline-legacy-note and does NOT render mfcc-pipeline-section, no crash. Guru login → direct navigation to same result id → all 4 MFCC sections render for guru role as well.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": [
+      {"component": "RN-Web lib", "issue": "Pre-existing console warning 'shadow* style props are deprecated. Use boxShadow.' — carried over from previous iterations, not related to new MFCC components."}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_mfcc_pipeline.py",
+    "/app/test_reports/pytest/iter7_mfcc.xml"
+  ],
+  "action_items": [
+    "None blocking. All requested MFCC pipeline features work as spec."
+  ],
+  "critical_code_review_comments": [
+    "_build_mfcc_display recomputes librosa.stft / mel_basis / pyin-independent stages inside the same request as _extract_mfcc_features (which also runs stft internally). This roughly doubles CPU on every upload. Consider passing S_power / log_mel from _extract_mfcc_features into _build_mfcc_display instead of recomputing.",
+    "viz.heatmap.values is a 13×96 float matrix (~1248 numbers) plus stage sample arrays are persisted into Mongo on every analysis. Doc size for the demo record is fine (<50KB) but if many uploads occur it will bloat the collection. Consider computing viz on-the-fly in GET /analyses/{id} from raw audio or storing compact int8 quantized heatmap.",
+    "score_breakdown.intonation.substitution branch for pitch_std==0 hard-codes 40 but the formula string still shows '|σ − 45| × 1.4'. Slightly misleading — either show the fallback formula in that case or expose a separate 'base_score_when_zero' field.",
+    "Legacy detection on the frontend uses `!data.mfcc_pipeline` which will also hide the new sections if a future analysis fails partway through _build_mfcc_display and stores partial data. Consider explicit boolean like `has_pipeline` from backend for clarity."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_mfcc_pipeline.py (new)"
+  ],
+  "success_rate": {"backend": "100% (7/7)", "frontend": "100% (all 10 testIDs verified across siswa new, siswa legacy, guru)"},
+  "test_credentials": "siswa@smkbinaguna.sch.id / siswa123 ; guru@smkbinaguna.sch.id / guru123",
+  "seed_data_creation": "Created TEST_MFCC_Pipeline analyses via POST /api/analyses during pytest run (multiple; safe to leave, prefixed TEST_).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend pytest file /app/backend/tests/test_mfcc_pipeline.py runs with `pytest -o addopts= backend/tests/test_mfcc_pipeline.py` (need to override pytest.ini addopts that force xdist). Frontend result screen has legacy vs new detection via `data.mfcc_pipeline` truthiness — legacy id 92d32a26-8d03-4568-a0ea-c503ab6d8353 confirmed showing 'mfcc-pipeline-legacy-note'. Pipeline-enabled id 2d5ad248-8383-4d41-a578-63ee1f0ca293 renders full sections. Note the intonation-score for pure-tone-ish uploads is ~37 (σ_pitch small) — this is expected per feature spec, not a bug.",
+  "rca_of_issue": "N/A — feature verified working."
+}
