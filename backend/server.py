@@ -1,0 +1,875 @@
+"""
+BicaraPro Backend — MFCC Public Speaking Analysis
+"""
+import os
+import io
+import uuid
+import shutil
+import logging
+import tempfile
+import subprocess
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Literal
+
+import numpy as np
+import librosa
+import soundfile as sf
+
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, UploadFile, File, status, Query
+from fastapi.responses import FileResponse
+from fastapi.security import OAuth2PasswordBearer
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
+from pydantic import BaseModel, EmailStr, Field
+import jwt
+from passlib.context import CryptContext
+from openai import OpenAI
+
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / ".env")
+
+# Ensure a usable ffmpeg is on PATH for librosa/audioread (used to decode
+# webm/opus/m4a/mp3). Container may not have an apt-installed ffmpeg, so we
+# fall back to the static binary bundled with the imageio-ffmpeg package.
+if not shutil.which("ffmpeg"):
+    try:
+        import imageio_ffmpeg
+        _ff_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        # Create a symlink named "ffmpeg" so tools that look up the plain
+        # command name (e.g. audioread) can find it.
+        _ff_link_dir = "/tmp/ffmpeg_bin"
+        os.makedirs(_ff_link_dir, exist_ok=True)
+        _ff_link = os.path.join(_ff_link_dir, "ffmpeg")
+        try:
+            if not os.path.exists(_ff_link):
+                os.symlink(_ff_exe, _ff_link)
+        except Exception:
+            pass
+        os.environ["PATH"] = _ff_link_dir + os.pathsep + os.environ.get("PATH", "")
+        os.environ.setdefault("FFMPEG_BINARY", _ff_exe)
+    except Exception:
+        pass
+
+MONGO_URL = os.environ["MONGO_URL"]
+DB_NAME = os.environ["DB_NAME"]
+JWT_SECRET = os.environ["JWT_SECRET"]
+JWT_ALG = os.environ.get("JWT_ALG", "HS256")
+ACCESS_TOKEN_MINUTES = int(os.environ.get("ACCESS_TOKEN_MINUTES", "1440"))
+EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
+
+UPLOAD_DIR = ROOT_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("bicarapro")
+
+client_mongo = AsyncIOMotorClient(MONGO_URL)
+db = client_mongo[DB_NAME]
+
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+# OpenAI client using Emergent LLM key (openai-compatible gateway for Whisper)
+openai_client = OpenAI(api_key=EMERGENT_LLM_KEY,
+                       base_url="https://integrations.emergentagent.com/llm")
+
+app = FastAPI(title="BicaraPro API")
+api = APIRouter(prefix="/api")
+
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+Role = Literal["siswa", "guru"]
+
+
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+    name: str = Field(min_length=1, max_length=100)
+    role: Role
+    kelas: Optional[str] = None  # for siswa
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: dict
+
+
+class UserOut(BaseModel):
+    id: str
+    email: EmailStr
+    name: str
+    role: Role
+    kelas: Optional[str] = None
+
+
+class AnalysisSummary(BaseModel):
+    id: str
+    user_id: str
+    user_name: str
+    title: str
+    intonation_score: float
+    clarity_score: float
+    overall_score: float
+    duration_seconds: float
+    created_at: str
+
+
+class AnalysisDetail(AnalysisSummary):
+    transcript: str
+    ai_feedback: str
+    corrected_transcript: Optional[str] = None
+    pronunciation_tips: Optional[str] = None
+    audio_url: Optional[str] = None
+    audio_mime: Optional[str] = None
+    mfcc_mean: List[float]
+    mfcc_std: List[float]
+    pitch_mean: float
+    pitch_std: float
+    rms_mean: float
+    zcr_mean: float
+    spectral_centroid_mean: float
+
+
+class Material(BaseModel):
+    id: str
+    title: str
+    category: str
+    content: str
+    icon: str
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+def hash_password(pw: str) -> str:
+    return pwd_ctx.hash(pw)
+
+
+def verify_password(pw: str, hashed: str) -> bool:
+    try:
+        return pwd_ctx.verify(pw, hashed)
+    except Exception:
+        return False
+
+
+def create_access_token(user_id: str, role: str) -> str:
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_MINUTES),
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    cred_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise cred_exc
+    except jwt.PyJWTError:
+        raise cred_exc
+
+    user = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not user:
+        raise cred_exc
+    return user
+
+
+def require_role(*roles: str):
+    async def _dep(user: dict = Depends(get_current_user)) -> dict:
+        if user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return user
+    return _dep
+
+
+def user_to_out(u: dict) -> dict:
+    return {
+        "id": u["id"],
+        "email": u["email"],
+        "name": u["name"],
+        "role": u["role"],
+        "kelas": u.get("kelas"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Audio / MFCC processing
+# ---------------------------------------------------------------------------
+def _resolve_ffmpeg_bin() -> str:
+    """Return a usable ffmpeg binary path.
+
+    Prefers a system ffmpeg if present, otherwise falls back to the static
+    binary bundled with the `imageio-ffmpeg` pip package. This makes audio
+    conversion work even when the container has no apt-installed ffmpeg
+    (apt installs do not persist across container restarts).
+    """
+    system_bin = shutil.which("ffmpeg")
+    if system_bin:
+        return system_bin
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "/usr/bin/ffmpeg"
+
+
+def _ffmpeg_to_wav(src_path: str) -> str:
+    """Convert any audio (webm/m4a/mp3/ogg/etc.) to a mono 22050 Hz WAV file.
+
+    Returns the path of the new .wav file, or raises RuntimeError on failure.
+    The caller is responsible for deleting the returned file.
+    """
+    ffmpeg_bin = _resolve_ffmpeg_bin()
+    dst_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+    try:
+        cmd = [
+            ffmpeg_bin, "-y", "-i", src_path,
+            "-ac", "1", "-ar", "22050", "-vn",
+            "-f", "wav", dst_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0 or not os.path.getsize(dst_path):
+            err = (result.stderr or b"").decode("utf-8", errors="ignore")[-400:]
+            raise RuntimeError(f"ffmpeg failed: {err}")
+        return dst_path
+    except Exception:
+        try:
+            os.remove(dst_path)
+        except Exception:
+            pass
+        raise
+
+
+def _extract_mfcc_features(audio_bytes: bytes, filename: str) -> dict:
+    """Extract MFCC + related features. Returns dict of feature stats."""
+    suffix = Path(filename).suffix or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    converted_path: Optional[str] = None
+    try:
+        # Try direct load first (fast path for .wav/.flac/.ogg-vorbis)
+        try:
+            y, sr = librosa.load(tmp_path, sr=22050, mono=True)
+        except Exception as first_err:
+            logger.info(
+                "Direct librosa load failed for %s (%s). Converting via ffmpeg...",
+                filename, first_err.__class__.__name__,
+            )
+            # Fallback: convert to wav with ffmpeg (handles webm/opus/m4a/mp3)
+            converted_path = _ffmpeg_to_wav(tmp_path)
+            y, sr = librosa.load(converted_path, sr=22050, mono=True)
+    finally:
+        for p in (tmp_path, converted_path):
+            if p:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+    if y.size == 0:
+        raise HTTPException(status_code=400, detail="Audio kosong / tidak dapat dibaca")
+
+    duration = librosa.get_duration(y=y, sr=sr)
+
+    # --- MFCC ---
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    mfcc_mean = mfcc.mean(axis=1).tolist()
+    mfcc_std = mfcc.std(axis=1).tolist()
+
+    # --- Pitch (fundamental frequency) for intonation ---
+    # pyin returns f0, voiced_flag, voiced_prob
+    f0, voiced_flag, _ = librosa.pyin(
+        y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr
+    )
+    f0_valid = f0[~np.isnan(f0)]
+    if f0_valid.size < 5:
+        pitch_mean = 0.0
+        pitch_std = 0.0
+    else:
+        pitch_mean = float(np.mean(f0_valid))
+        pitch_std = float(np.std(f0_valid))
+
+    # --- RMS energy ---
+    rms = librosa.feature.rms(y=y)[0]
+    rms_mean = float(np.mean(rms))
+
+    # --- Zero crossing rate ---
+    zcr = librosa.feature.zero_crossing_rate(y=y)[0]
+    zcr_mean = float(np.mean(zcr))
+
+    # --- Spectral centroid (brightness / clarity indicator) ---
+    sc = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+    sc_mean = float(np.mean(sc))
+
+    # --- Spectral flatness (0=tone, 1=noise) — lower = clearer voice ---
+    sf_flat = librosa.feature.spectral_flatness(y=y)[0]
+    sf_mean = float(np.mean(sf_flat))
+
+    # ---- Scoring ---------------------------------------------------------
+    # Intonasi: variation of pitch is desirable but not extreme.
+    # Ideal std ~ 25–60 Hz for expressive speech.
+    if pitch_std == 0:
+        intonation_score = 40.0
+    else:
+        # Bell curve centered at 45 Hz std
+        target = 45.0
+        diff = abs(pitch_std - target)
+        intonation_score = max(0.0, 100.0 - (diff * 1.4))
+    intonation_score = float(np.clip(intonation_score, 0, 100))
+
+    # Kejelasan: high RMS (loud enough), low spectral flatness, moderate ZCR.
+    # Normalize each into 0..1 then combine.
+    rms_score = float(np.clip(rms_mean / 0.08, 0, 1))          # louder = clearer up to a point
+    flat_score = float(np.clip(1.0 - (sf_mean / 0.4), 0, 1))    # less noisy = clearer
+    zcr_score = float(np.clip(1.0 - abs(zcr_mean - 0.08) / 0.15, 0, 1))
+    clarity_score = float(np.clip((rms_score * 0.45 + flat_score * 0.40 + zcr_score * 0.15) * 100, 0, 100))
+
+    overall_score = float(np.round((intonation_score + clarity_score) / 2, 1))
+
+    return {
+        "duration_seconds": float(round(duration, 2)),
+        "mfcc_mean": [round(v, 3) for v in mfcc_mean],
+        "mfcc_std": [round(v, 3) for v in mfcc_std],
+        "pitch_mean": round(pitch_mean, 2),
+        "pitch_std": round(pitch_std, 2),
+        "rms_mean": round(rms_mean, 4),
+        "zcr_mean": round(zcr_mean, 4),
+        "spectral_centroid_mean": round(sc_mean, 2),
+        "spectral_flatness_mean": round(sf_mean, 4),
+        "intonation_score": round(intonation_score, 1),
+        "clarity_score": round(clarity_score, 1),
+        "overall_score": overall_score,
+    }
+
+
+def _transcribe_audio(audio_bytes: bytes, filename: str) -> str:
+    """Transcribe with Whisper-1 via Emergent LLM gateway."""
+    suffix = Path(filename).suffix or ".wav"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as af:
+            result = openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=af,
+                language="id",
+            )
+        # Some gateways return a JSON string, some return an object
+        if isinstance(result, str):
+            try:
+                import json as _json
+                parsed = _json.loads(result)
+                text = parsed.get("text", "") if isinstance(parsed, dict) else result
+            except Exception:
+                text = result
+        else:
+            text = getattr(result, "text", "") or ""
+        return (text or "").strip()
+    except Exception as e:
+        logger.warning("Whisper transcription failed: %s", e)
+        return ""
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+async def _generate_ai_feedback(features: dict, transcript: str, user_name: str) -> str:
+    """Generate narrative feedback using Claude Haiku 4.5."""
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"feedback-{uuid.uuid4()}",
+            system_message=(
+                "Kamu adalah pelatih public speaking berbahasa Indonesia. "
+                "Berdasarkan hasil analisis MFCC (Mel-Frequency Cepstral Coefficients), "
+                "berikan feedback singkat, membangun, dan spesifik (maks 4 paragraf pendek) "
+                "kepada siswa SMK. Sertakan: 1) Apresiasi, 2) Analisis intonasi, "
+                "3) Analisis kejelasan suara, 4) Saran latihan konkret."
+            ),
+        ).with_model("anthropic", "claude-haiku-4-5-20251001")
+
+        prompt = (
+            f"Nama siswa: {user_name}\n"
+            f"Skor Intonasi: {features['intonation_score']}/100\n"
+            f"Skor Kejelasan: {features['clarity_score']}/100\n"
+            f"Skor Keseluruhan: {features['overall_score']}/100\n"
+            f"Durasi: {features['duration_seconds']} detik\n"
+            f"Rata-rata pitch: {features['pitch_mean']} Hz (variasi std: {features['pitch_std']} Hz)\n"
+            f"Energi RMS: {features['rms_mean']}\n"
+            f"Zero crossing rate: {features['zcr_mean']}\n"
+            f"Spectral centroid: {features['spectral_centroid_mean']} Hz\n"
+            f"\nTranskrip (subtitle):\n\"{transcript or '(transkrip tidak tersedia)'}\"\n\n"
+            "Berikan feedback membangun dalam Bahasa Indonesia."
+        )
+        response = await chat.send_message(UserMessage(text=prompt))
+        return response.strip() if isinstance(response, str) else str(response).strip()
+    except Exception as e:
+        logger.warning("AI feedback failed: %s", e)
+        return (
+            "Selamat, kamu sudah berlatih hari ini! Berdasarkan hasil MFCC, teruslah "
+            "berlatih variasi intonasi dan artikulasi yang jelas. Ulangi latihan secara rutin "
+            "untuk melihat kemajuan."
+        )
+
+
+async def _generate_correction(transcript: str, features: dict) -> dict:
+    """Generate corrected transcript + pronunciation tips using Claude.
+
+    Returns dict with keys: 'corrected_transcript', 'pronunciation_tips'.
+    Both are plain-text Bahasa Indonesia, ready to be spoken by TTS.
+    """
+    # Fallback when transcript is empty
+    if not transcript or not transcript.strip():
+        return {
+            "corrected_transcript": (
+                "Selamat pagi teman-teman. Pada kesempatan kali ini, "
+                "saya ingin menyampaikan materi singkat dengan intonasi yang jelas dan tempo yang tenang. "
+                "Terima kasih atas perhatian kalian."
+            ),
+            "pronunciation_tips": (
+                "Bicaralah perlahan dan artikulasikan setiap kata dengan jelas. "
+                "Beri jeda singkat setelah tanda koma dan tanda titik. "
+                "Naikkan sedikit nada suara pada kata kunci untuk memberi penekanan."
+            ),
+        }
+
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"correction-{uuid.uuid4()}",
+            system_message=(
+                "Kamu adalah pelatih public speaking berbahasa Indonesia. "
+                "Tugasmu MEMPERBAIKI transkrip pidato siswa dan memberikan tips pengucapan. "
+                "Aturan output SANGAT KETAT:\n"
+                "1. Balas HANYA dalam format JSON valid dengan dua kunci:\n"
+                "   - \"corrected_transcript\": string berisi transkrip yang sudah diperbaiki "
+                "(tata bahasa, ejaan, pengulangan/filler dihilangkan, kalimat dirapikan) "
+                "dalam Bahasa Indonesia yang natural dan enak didengar. "
+                "Panjang mirip aslinya, jangan tambah topik baru. "
+                "Gunakan tanda baca (koma, titik) agar TTS bisa membaca dengan jeda natural.\n"
+                "   - \"pronunciation_tips\": string 1-2 kalimat berisi tips pengucapan konkret "
+                "(intonasi, tempo, jeda) yang HARUS didengar siswa. "
+                "Tulis dalam Bahasa Indonesia yang bisa dibaca TTS.\n"
+                "2. JANGAN sertakan markdown, code fence, komentar, atau teks lain di luar JSON.\n"
+                "3. JANGAN gunakan emoji atau karakter khusus."
+            ),
+        ).with_model("anthropic", "claude-haiku-4-5-20251001")
+
+        prompt = (
+            f"Transkrip siswa: \"{transcript}\"\n"
+            f"Skor intonasi: {features['intonation_score']}/100\n"
+            f"Skor kejelasan: {features['clarity_score']}/100\n"
+            f"Variasi pitch (std): {features['pitch_std']} Hz\n\n"
+            "Perbaiki transkrip di atas dan berikan tips pengucapan. "
+            "Balas hanya dalam JSON dengan kunci corrected_transcript dan pronunciation_tips."
+        )
+
+        response = await chat.send_message(UserMessage(text=prompt))
+        text = response.strip() if isinstance(response, str) else str(response).strip()
+
+        # Try to parse JSON robustly (strip code fences if any)
+        import json as _json
+        import re as _re
+        cleaned = text
+        if cleaned.startswith("```"):
+            cleaned = _re.sub(r"^```(?:json)?", "", cleaned).strip()
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3].strip()
+        # Extract first JSON object
+        match = _re.search(r"\{.*\}", cleaned, _re.DOTALL)
+        json_str = match.group(0) if match else cleaned
+        parsed = _json.loads(json_str)
+        corrected = str(parsed.get("corrected_transcript", "")).strip()
+        tips = str(parsed.get("pronunciation_tips", "")).strip()
+        if not corrected:
+            corrected = transcript
+        if not tips:
+            tips = (
+                "Bicara dengan tempo tenang, artikulasi jelas, dan beri jeda pada tanda baca. "
+                "Beri penekanan pada kata kunci."
+            )
+        return {"corrected_transcript": corrected, "pronunciation_tips": tips}
+    except Exception as e:
+        logger.warning("Correction generation failed: %s", e)
+        return {
+            "corrected_transcript": transcript,
+            "pronunciation_tips": (
+                "Bicara dengan tempo tenang, artikulasi jelas, dan beri jeda pada tanda baca. "
+                "Beri penekanan pada kata kunci."
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+@api.post("/auth/register", response_model=TokenOut)
+async def register(data: RegisterIn):
+    existing = await db.users.find_one({"email": data.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email sudah terdaftar")
+    uid = str(uuid.uuid4())
+    user_doc = {
+        "id": uid,
+        "email": data.email.lower(),
+        "name": data.name,
+        "role": data.role,
+        "kelas": data.kelas,
+        "password_hash": hash_password(data.password),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.users.insert_one(user_doc)
+    token = create_access_token(uid, data.role)
+    return {"access_token": token, "token_type": "bearer", "user": user_to_out(user_doc)}
+
+
+@api.post("/auth/login", response_model=TokenOut)
+async def login(data: LoginIn):
+    user = await db.users.find_one({"email": data.email.lower()}, {"_id": 0})
+    if not user or not verify_password(data.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Email atau password salah")
+    token = create_access_token(user["id"], user["role"])
+    return {"access_token": token, "token_type": "bearer", "user": user_to_out(user)}
+
+
+@api.get("/auth/me")
+async def me(user: dict = Depends(get_current_user)):
+    return user_to_out(user)
+
+
+# ---------------------------------------------------------------------------
+# Analysis endpoints
+# ---------------------------------------------------------------------------
+@api.post("/analyses", response_model=AnalysisDetail)
+async def create_analysis(
+    file: UploadFile = File(...),
+    title: str = "Latihan Public Speaking",
+    user: dict = Depends(get_current_user),
+):
+    if user["role"] != "siswa":
+        raise HTTPException(status_code=403, detail="Hanya siswa yang dapat mengunggah rekaman")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="File audio kosong")
+    if len(content) > 24 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Ukuran audio maksimal 24MB")
+
+    try:
+        features = _extract_mfcc_features(content, file.filename or "audio.wav")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("MFCC extraction failed")
+        raise HTTPException(status_code=500, detail=f"Gagal menganalisis audio: {e}")
+
+    transcript = _transcribe_audio(content, file.filename or "audio.wav")
+    ai_feedback = await _generate_ai_feedback(features, transcript, user["name"])
+    correction = await _generate_correction(transcript, features)
+
+    aid = str(uuid.uuid4())
+
+    # Persist audio to disk so it can be played back later
+    orig_name = file.filename or "audio.wav"
+    ext = (Path(orig_name).suffix or ".wav").lower()
+    audio_filename = f"{aid}{ext}"
+    audio_mime = file.content_type or "audio/wav"
+    try:
+        with open(UPLOAD_DIR / audio_filename, "wb") as fout:
+            fout.write(content)
+    except Exception:
+        logger.exception("Failed to persist audio file")
+        audio_filename = None
+
+    doc = {
+        "id": aid,
+        "user_id": user["id"],
+        "user_name": user["name"],
+        "user_kelas": user.get("kelas"),
+        "title": title or "Latihan Public Speaking",
+        "transcript": transcript,
+        "ai_feedback": ai_feedback,
+        "corrected_transcript": correction["corrected_transcript"],
+        "pronunciation_tips": correction["pronunciation_tips"],
+        "audio_filename": audio_filename,
+        "audio_mime": audio_mime,
+        **features,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.analyses.insert_one(doc)
+    doc.pop("_id", None)
+    doc["audio_url"] = f"/api/analyses/{aid}/audio" if audio_filename else None
+    return doc
+
+
+@api.get("/analyses/history", response_model=List[AnalysisSummary])
+async def my_history(user: dict = Depends(get_current_user)):
+    cursor = db.analyses.find(
+        {"user_id": user["id"]},
+        {"_id": 0, "id": 1, "user_id": 1, "user_name": 1, "title": 1,
+         "intonation_score": 1, "clarity_score": 1, "overall_score": 1,
+         "duration_seconds": 1, "created_at": 1},
+    ).sort("created_at", -1).limit(100)
+    return [row async for row in cursor]
+
+
+@api.get("/analyses/{analysis_id}", response_model=AnalysisDetail)
+async def get_analysis(analysis_id: str, user: dict = Depends(get_current_user)):
+    doc = await db.analyses.find_one({"id": analysis_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Analisis tidak ditemukan")
+    # Access control: siswa may only see their own; guru may see any.
+    if user["role"] == "siswa" and doc["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if doc.get("audio_filename"):
+        doc["audio_url"] = f"/api/analyses/{analysis_id}/audio"
+
+    # Backfill correction for legacy analyses that don't have it yet
+    if not doc.get("corrected_transcript"):
+        features = {
+            "intonation_score": doc.get("intonation_score", 0),
+            "clarity_score": doc.get("clarity_score", 0),
+            "pitch_std": doc.get("pitch_std", 0),
+        }
+        correction = await _generate_correction(doc.get("transcript", ""), features)
+        doc["corrected_transcript"] = correction["corrected_transcript"]
+        doc["pronunciation_tips"] = correction["pronunciation_tips"]
+        try:
+            await db.analyses.update_one(
+                {"id": analysis_id},
+                {"$set": {
+                    "corrected_transcript": doc["corrected_transcript"],
+                    "pronunciation_tips": doc["pronunciation_tips"],
+                }},
+            )
+        except Exception:
+            logger.warning("Failed to backfill correction for %s", analysis_id)
+    return doc
+
+
+@api.get("/analyses/{analysis_id}/audio")
+async def get_analysis_audio(
+    analysis_id: str,
+    token: Optional[str] = Query(default=None),
+    user_dep: Optional[dict] = None,
+):
+    """Stream saved audio file. Accepts token via query param OR Authorization header."""
+    # Manual auth so <audio> tags without headers can still play via ?token=...
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+            user_id = payload.get("sub")
+            if not user_id:
+                raise HTTPException(status_code=401, detail="Invalid token")
+            user = await db.users.find_one({"id": user_id}, {"_id": 0})
+            if not user:
+                raise HTTPException(status_code=401, detail="User not found")
+        except jwt.PyJWTError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    else:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    doc = await db.analyses.find_one({"id": analysis_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Analisis tidak ditemukan")
+    if user["role"] == "siswa" and doc["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    fname = doc.get("audio_filename")
+    if not fname:
+        raise HTTPException(status_code=404, detail="Audio tidak tersedia")
+    fpath = UPLOAD_DIR / fname
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail="File audio hilang")
+    return FileResponse(str(fpath), media_type=doc.get("audio_mime") or "audio/mpeg", filename=fname)
+
+
+# ---------------------------------------------------------------------------
+# Materials endpoints
+# ---------------------------------------------------------------------------
+@api.get("/materials", response_model=List[Material])
+async def list_materials(user: dict = Depends(get_current_user)):
+    cursor = db.materials.find({}, {"_id": 0}).sort("order", 1)
+    return [row async for row in cursor]
+
+
+# ---------------------------------------------------------------------------
+# Teacher endpoints
+# ---------------------------------------------------------------------------
+@api.get("/teacher/students")
+async def teacher_students(user: dict = Depends(require_role("guru"))):
+    students = await db.users.find({"role": "siswa"}, {"_id": 0, "password_hash": 0}).to_list(500)
+
+    # Attach latest score & count per student
+    result = []
+    for s in students:
+        latest = await db.analyses.find_one(
+            {"user_id": s["id"]},
+            {"_id": 0, "overall_score": 1, "intonation_score": 1, "clarity_score": 1, "created_at": 1, "id": 1},
+            sort=[("created_at", -1)],
+        )
+        count = await db.analyses.count_documents({"user_id": s["id"]})
+        # Compute average overall score
+        pipeline = [
+            {"$match": {"user_id": s["id"]}},
+            {"$group": {"_id": None, "avg": {"$avg": "$overall_score"}}},
+        ]
+        avg_cursor = db.analyses.aggregate(pipeline)
+        avg_doc = await avg_cursor.to_list(1)
+        avg_score = round(avg_doc[0]["avg"], 1) if avg_doc else 0.0
+
+        result.append({
+            **s,
+            "latest": latest,
+            "recording_count": count,
+            "average_score": avg_score,
+        })
+    # Sort by average score desc
+    result.sort(key=lambda r: r["average_score"], reverse=True)
+    return result
+
+
+@api.get("/teacher/students/{student_id}/analyses", response_model=List[AnalysisSummary])
+async def teacher_student_history(student_id: str, user: dict = Depends(require_role("guru"))):
+    cursor = db.analyses.find(
+        {"user_id": student_id},
+        {"_id": 0, "id": 1, "user_id": 1, "user_name": 1, "title": 1,
+         "intonation_score": 1, "clarity_score": 1, "overall_score": 1,
+         "duration_seconds": 1, "created_at": 1},
+    ).sort("created_at", -1).limit(200)
+    return [row async for row in cursor]
+
+
+@api.get("/teacher/stats")
+async def teacher_stats(user: dict = Depends(require_role("guru"))):
+    total_students = await db.users.count_documents({"role": "siswa"})
+    total_analyses = await db.analyses.count_documents({})
+    pipeline = [{"$group": {"_id": None, "avg": {"$avg": "$overall_score"}}}]
+    agg = await db.analyses.aggregate(pipeline).to_list(1)
+    class_average = round(agg[0]["avg"], 1) if agg else 0.0
+    return {
+        "total_students": total_students,
+        "total_analyses": total_analyses,
+        "class_average": class_average,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health & Seed
+# ---------------------------------------------------------------------------
+@api.get("/")
+async def root():
+    return {"message": "BicaraPro API", "status": "ok"}
+
+
+@app.on_event("startup")
+async def seed_data():
+    # Seed materials
+    if await db.materials.count_documents({}) == 0:
+        materials = [
+            {"id": str(uuid.uuid4()), "order": 1, "icon": "mic-outline",
+             "title": "Pemanasan Vokal", "category": "Persiapan",
+             "content": (
+                 "Sebelum berbicara di depan umum, lakukan pemanasan vokal selama 5-10 menit. "
+                 "Latih napas diafragma: tarik napas 4 hitungan, tahan 4 hitungan, buang 8 hitungan. "
+                 "Ucapkan huruf vokal (A-I-U-E-O) dengan artikulasi jelas."
+             )},
+            {"id": str(uuid.uuid4()), "order": 2, "icon": "musical-notes-outline",
+             "title": "Menguasai Intonasi", "category": "Teknik",
+             "content": (
+                 "Intonasi yang baik membuat audiens tetap tertarik. Variasikan tinggi rendah suaramu "
+                 "sesuai emosi dan pesan yang disampaikan. Hindari nada monoton — beri penekanan pada "
+                 "kata kunci untuk menciptakan ritme yang dinamis."
+             )},
+            {"id": str(uuid.uuid4()), "order": 3, "icon": "volume-high-outline",
+             "title": "Kejelasan Artikulasi", "category": "Teknik",
+             "content": (
+                 "Ucapkan setiap konsonan dengan jelas. Buka mulut lebih lebar dari biasanya dan "
+                 "gunakan lidah, gigi, serta bibir secara aktif. Latih tongue twister setiap hari "
+                 "untuk melenturkan otot bicara."
+             )},
+            {"id": str(uuid.uuid4()), "order": 4, "icon": "timer-outline",
+             "title": "Mengatur Tempo", "category": "Teknik",
+             "content": (
+                 "Bicaralah dengan tempo 130-160 kata per menit. Beri jeda 1-2 detik setelah kalimat "
+                 "penting agar audiens dapat mencerna pesan. Hindari kata pengisi seperti 'eee', 'anu', "
+                 "atau 'terus'."
+             )},
+            {"id": str(uuid.uuid4()), "order": 5, "icon": "people-outline",
+             "title": "Mengatasi Grogi", "category": "Mental",
+             "content": (
+                 "Grogi itu wajar. Kuncinya: persiapan matang, tarik napas dalam sebelum tampil, "
+                 "fokus pada pesan bukan pada diri sendiri, dan tatap 3-4 titik di ruangan secara "
+                 "bergantian agar terlihat menyapa seluruh audiens."
+             )},
+            {"id": str(uuid.uuid4()), "order": 6, "icon": "book-outline",
+             "title": "Struktur Pidato", "category": "Struktur",
+             "content": (
+                 "Gunakan struktur klasik: Pembuka (menarik perhatian), Isi (3 poin utama dengan "
+                 "contoh), Penutup (kesimpulan + call-to-action). Buat pembuka yang kuat dalam 30 "
+                 "detik pertama."
+             )},
+        ]
+        await db.materials.insert_many(materials)
+        logger.info("Seeded %d materials", len(materials))
+
+    # Seed demo users
+    if await db.users.count_documents({}) == 0:
+        demo_users = [
+            {"id": str(uuid.uuid4()), "email": "guru@smkbinaguna.sch.id", "name": "Bu Sari (Guru)",
+             "role": "guru", "kelas": None,
+             "password_hash": hash_password("guru123"),
+             "created_at": datetime.now(timezone.utc).isoformat()},
+            {"id": str(uuid.uuid4()), "email": "siswa@smkbinaguna.sch.id", "name": "Andi Pratama",
+             "role": "siswa", "kelas": "XII-TKJ",
+             "password_hash": hash_password("siswa123"),
+             "created_at": datetime.now(timezone.utc).isoformat()},
+        ]
+        await db.users.insert_many(demo_users)
+        logger.info("Seeded %d demo users", len(demo_users))
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    client_mongo.close()
+
+
+# ---------------------------------------------------------------------------
+# Mount
+# ---------------------------------------------------------------------------
+app.include_router(api)
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)

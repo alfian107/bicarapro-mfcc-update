@@ -1,0 +1,234 @@
+{
+  "app_name": "BicaraPro",
+  "personality": "1 iOS-Native Clean",
+  "personality_one_liner": "A clean, focused, and encouraging educational space that builds public speaking confidence through instant, clear feedback.",
+  "color": {
+    "light": {
+      "surface": "#F8FAFC",
+      "onSurface": "#0F172A",
+      "surfaceSecondary": "#FFFFFF",
+      "onSurfaceSecondary": "#1E293B",
+      "surfaceTertiary": "#F1F5F9",
+      "onSurfaceTertiary": "#475569",
+      "surfaceInverse": "#0F172A",
+      "onSurfaceInverse": "#FFFFFF",
+      "brand": "#0D9488",
+      "brandPrimary": "#0D9488",
+      "onBrandPrimary": "#FFFFFF",
+      "brandSecondary": "#0F766E",
+      "onBrandSecondary": "#FFFFFF",
+      "brandTertiary": "#CCFBF1",
+      "onBrandTertiary": "#115E59",
+      "success": "#10B981",
+      "onSuccess": "#FFFFFF",
+      "warning": "#F59E0B",
+      "onWarning": "#FFFFFF",
+      "error": "#EF4444",
+      "onError": "#FFFFFF",
+      "info": "#3B82F6",
+      "onInfo": "#FFFFFF",
+      "border": "#E2E8F0",
+      "borderStrong": "#CBD5E1",
+      "divider": "#F1F5F9"
+    },
+    "dark": {
+      "surface": "#0F172A",
+      "onSurface": "#F8FAFC",
+      "surfaceSecondary": "#1E293B",
+      "onSurfaceSecondary": "#F1F5F9",
+      "surfaceTertiary": "#334155",
+      "onSurfaceTertiary": "#CBD5E1",
+      "surfaceInverse": "#F8FAFC",
+      "onSurfaceInverse": "#0F172A",
+      "brand": "#2DD4BF",
+      "brandPrimary": "#14B8A6",
+      "onBrandPrimary": "#042F2E",
+      "brandSecondary": "#0D9488",
+      "onBrandSecondary": "#FFFFFF",
+      "brandTertiary": "#134E4A",
+      "onBrandTertiary": "#CCFBF1",
+      "success": "#34D399",
+      "onSuccess": "#064E3B",
+      "warning": "#FCD34D",
+      "onWarning": "#78350F",
+      "error": "#F87171",
+      "onError": "#450A0A",
+      "info": "#60A5FA",
+      "onInfo": "#1E3A8A",
+      "border": "#334155",
+      "borderStrong": "#475569",
+      "divider": "#1E293B"
+    }
+  },
+  "typography": {
+    "displayFontFamily": "PlusJakartaSans-Bold",
+    "textFontFamily": "PlusJakartaSans-Medium",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Use generous iOS-native spacing padding around content. Avoid dense dashboard-style layouts unless the app is data-heavy.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": "1",
+  "navigation": "bottom_tabs",
+  "icon_set": "Ionicons",
+  "glassmorphism": {
+    "enabled": "true",
+    "do's": [
+      "Use glass on bottom tab bar when content scrolls behind it",
+      "Use glass on sticky headers over scrolling content",
+      "Use glass for the sticky 'Mulai Latihan' primary CTA container at the bottom of the Home screen"
+    ],
+    "dont's": [
+      "Never apply glass to form fields or body text regions",
+      "Avoid glass everywhere; keep it restricted to elevated surfaces like headers and sticky CTAs"
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "haptics": {
+    "events": {
+      "primary_button_press": "light",
+      "start_recording": "medium",
+      "stop_recording": "heavy",
+      "tab_change": "light",
+      "score_reveal": "success",
+      "role_select": "selection"
+    }
+  },
+  "screens": [
+    {
+      "name": "Onboarding",
+      "purpose": "Introduce the app's MFCC voice analysis capabilities and let the user select their role (Siswa/Guru).",
+      "states": {
+        "loading": "Centered spinner",
+        "empty": "N/A",
+        "error": "N/A"
+      },
+      "layout": "Full-bleed hero image with vertical gradient scrim (transparent to surfaceInverse). Role selection buttons (Siswa / Guru) placed in the bottom 30% of the screen inside a glass-effect container."
+    },
+    {
+      "name": "Login",
+      "purpose": "Simple authentication screen.",
+      "states": {
+        "loading": "Spinner on submit button",
+        "empty": "N/A",
+        "error": "Error toast or inline red text"
+      },
+      "layout": "Clean, single-column form with labels above inputs. Sticky submit button at bottom inside KeyboardAvoidingView."
+    },
+    {
+      "name": "StudentHome",
+      "purpose": "Dashboard for students showing recent progress and the primary action to start a new speaking practice.",
+      "states": {
+        "loading": "Skeleton cards for history",
+        "empty": "Illustration + 'Belum ada rekaman. Mulai latihan pertamamu!'",
+        "error": "Readable message + Retry button"
+      },
+      "layout": "Top section: Welcome message + high-level stats (e.g., average score). Middle section: horizontal scroll of 'Tips Public Speaking', followed by a vertical list of recent history. Bottom: Sticky 'Mulai Latihan' primary CTA floating over a glass background above the safe area."
+    },
+    {
+      "name": "Recording",
+      "purpose": "Focused, minimalist screen for recording public speaking audio with real-time waveform feedback.",
+      "states": {
+        "loading": "Preparing microphone...",
+        "empty": "Tap to start recording",
+        "error": "Microphone permission denied + Settings button"
+      },
+      "layout": "Centered massive microphone button surrounded by brandTertiary pulsing rings. Top: clear large timer (e.g., 00:00). Center: Abstract wavy visual or real waveform to indicate voice input. Bottom: Sticky 'Selesai' (Done) button."
+    },
+    {
+      "name": "AnalysisResult",
+      "purpose": "Display detailed MFCC-based intonation and clarity scores, transcript, and AI feedback.",
+      "states": {
+        "loading": "Analyzing audio with MFCC algorithms... (Centered spinner with encouraging text)",
+        "empty": "N/A",
+        "error": "Failed to analyze audio + Retry button"
+      },
+      "layout": "Top: Two large metric cards side-by-side (Intonasi & Kejelasan Suara). Middle: Scrollable transcript with highlighted text. Below that: A visually distinct card (brandTertiary tint) for Claude AI's narrative feedback. Bottom: MFCC waveform snapshot image."
+    },
+    {
+      "name": "HistoryList",
+      "purpose": "Archive of past recordings with scores.",
+      "states": {
+        "loading": "Spinner",
+        "empty": "No recordings yet.",
+        "error": "Failed to load history."
+      },
+      "layout": "Vertical list of cards. Each card contains the date, a mini-waveform icon, and the two scores (Intonation & Clarity). Generous md padding between cards."
+    },
+    {
+      "name": "Materials",
+      "purpose": "Library of public speaking tips and materials.",
+      "states": {
+        "loading": "Spinner",
+        "empty": "No materials available.",
+        "error": "Failed to load materials."
+      },
+      "layout": "Grid of cards (2-column). Each card has a tinted icon container (brandTertiary) and a title. iOS-native spacing."
+    },
+    {
+      "name": "TeacherDashboard",
+      "purpose": "Overview of student performances for the Guru role.",
+      "states": {
+        "loading": "Skeleton list",
+        "empty": "No students registered yet.",
+        "error": "Failed to load student data."
+      },
+      "layout": "Hero section: Classroom image with a gradient scrim displaying total students and class average. Below: Vertical list of students, showing their name, avatar (initials fallback), and latest score. Tapping a student opens their history."
+    }
+  ],
+  "images": {
+    "onboarding_hero": {
+      "url": "https://images.unsplash.com/photo-1715610258704-e8f9f5710fe0?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzB8MHwxfHNlYXJjaHwyfHxlZHVjYXRpb24lMjBwdWJsaWMlMjBzcGVha2luZyUyMHN0dWRlbnR8ZW58MHx8fHwxNzg1MjU5MTExfDA&ixlib=rb-4.1.0&q=85",
+      "alt": "Woman speaking in front of a crowd holding a microphone"
+    },
+    "recording_wave_bg": {
+      "url": "https://images.unsplash.com/photo-1777908484215-a3834567b8bf?crop=entropy&cs=srgb&fm=jpg&ixid=M3w7NTY2OTF8MHwxfHNlYXJjaHwxfHx2b2ljZSUyMHdhdmUlMjBhdWRpbyUyMHJlY29yZGluZyUyMGFic3RyYWN0fGVufDB8fHx8MTc4NTI1OTExMXww&ixlib=rb-4.1.0&q=85",
+      "alt": "Abstract blue wavy lines on a white background"
+    },
+    "teacher_dashboard_hero": {
+      "url": "https://images.unsplash.com/photo-1604525241109-c3b7eecf4add?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NjZ8MHwxfHNlYXJjaHwyfHx0ZWFjaGVyJTIwc3R1ZGVudCUyMGNsYXNzcm9vbSUyMGhpZ2glMjBzY2hvb2x8ZW58MHx8fHwxNzg1MjU5MTExfDA&ixlib=rb-4.1.0&q=85",
+      "alt": "Classroom environment"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Follow the '1 iOS-Native Clean' personality strictly. Use generous safe-area padding and avoid dense dashboard layouts.",
+    "Implement the requested 'biru/hijau' (Teal/Emerald) theme. The primary brand color is a rich Teal (#0D9488). Avoid using default iOS blue or Material purple.",
+    "For the 'StudentHome' screen, the 'Mulai Latihan' (Start Practice) button MUST be a sticky CTA placed at the bottom, floating over the scrolling content using a glass effect container to ensure thumb reachability.",
+    "Onboarding and Teacher Dashboard use hero images. You MUST apply a vertical gradient scrim (transparent at 0%, 20% surfaceInverse at 50%, 70%+ surfaceInverse at 100%) underneath any text overlaid on these images to ensure readability.",
+    "Wire up the haptic feedbacks exactly as specified in the 'haptics' block (e.g., medium haptic when starting a recording, heavy when stopping).",
+    "Ensure all text is in Indonesian as per the problem statement (e.g., 'Siswa', 'Guru', 'Intonasi', 'Kejelasan Suara').",
+    "For the AI feedback section on 'AnalysisResult', use a distinct card with a 'brandTertiary' background to make the Claude Haiku narrative feedback feel premium and separate from the numerical MFCC scores.",
+    "Never use raw hex colors in components; always reference the color tokens provided in the design_guidelines.json.",
+    "Use 'Plus Jakarta Sans' with capped font-weights (max 500/Medium) across the app to maintain a clean editorial feel."
+  ]
+}
