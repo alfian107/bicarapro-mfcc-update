@@ -1,4 +1,9 @@
 # PRD — BicaraPro
+
+## Session Log
+- **2026-09-30**: Environment recovery + object-storage migration. Restored missing `backend/.env` & `frontend/.env`; installed backend pip deps (librosa etc.) and frontend `node_modules`; fixed missing `LlmChat`/`UserMessage` imports (crash-loop); **migrated audio uploads from pod-local `uploads/` to Emergent object storage** (`bicarapro/uploads/<user_id>/<file>`, streamed via `GET /api/analyses/{id}/audio` with legacy local fallback); pinned Expo Metro to port 3000 (`expo start --port 3000`). Tested: 37/37 backend pytest + full frontend flows green (iteration_6).
+- **Backlog**: P1 record-flow UI test on a real device/mic; P2 backfill legacy local audio files into object storage; P2 expose `audio_storage_path` in AnalysisDetail if needed; P3 ffmpeg setup-error gating in test_audio_formats.py.
+
 **Implementasi Algoritma MFCC untuk Analisis Intonasi & Kejelasan Suara Public Speaking**
 _(SMK Swasta Binaguna Tanah Jawa)_
 
