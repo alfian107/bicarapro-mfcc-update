@@ -4,7 +4,7 @@ import requests
 import numpy as np
 import soundfile as sf
 
-BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://voice-record-debug.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://app-dev-hub-4278.preview.emergentagent.com").rstrip("/")
 API = f"{BASE_URL}/api"
 
 

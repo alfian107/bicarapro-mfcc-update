@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 
 # Backend URL from environment
-BACKEND_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://voice-record-debug.preview.emergentagent.com")
+BACKEND_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://app-dev-hub-4278.preview.emergentagent.com")
 API_BASE = f"{BACKEND_URL}/api"
 
 # Test credentials

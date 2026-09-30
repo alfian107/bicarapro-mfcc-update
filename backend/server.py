@@ -17,15 +17,17 @@ import librosa
 import soundfile as sf
 
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, UploadFile, File, status, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.security import OAuth2PasswordBearer
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from pydantic import BaseModel, EmailStr, Field
 import jwt
+import requests
 from passlib.context import CryptContext
 from openai import OpenAI
+from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 # ---------------------------------------------------------------------------
 # Bootstrap
@@ -62,8 +64,45 @@ JWT_ALG = os.environ.get("JWT_ALG", "HS256")
 ACCESS_TOKEN_MINUTES = int(os.environ.get("ACCESS_TOKEN_MINUTES", "1440"))
 EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
 
-UPLOAD_DIR = ROOT_DIR / "uploads"
+UPLOAD_DIR = ROOT_DIR / "uploads"  # legacy local audio (pre object-storage)
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Emergent object storage (audio persists across pod restarts/deploys)
+STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
+STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
+APP_NAME = "bicarapro"
+_storage_key: Optional[str] = None
+
+
+def init_storage(force: bool = False) -> str:
+    global _storage_key
+    if _storage_key and not force:
+        return _storage_key
+    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_LLM_KEY}, timeout=30)
+    resp.raise_for_status()
+    _storage_key = resp.json()["storage_key"]
+    return _storage_key
+
+
+def put_object(path: str, data: bytes, content_type: str) -> dict:
+    resp = requests.put(
+        f"{STORAGE_URL}/objects/{path}",
+        headers={"X-Storage-Key": init_storage(), "Content-Type": content_type},
+        data=data,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_object(path: str):
+    resp = requests.get(
+        f"{STORAGE_URL}/objects/{path}",
+        headers={"X-Storage-Key": init_storage()},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -598,16 +637,18 @@ async def create_analysis(
 
     aid = str(uuid.uuid4())
 
-    # Persist audio to disk so it can be played back later
+    # Persist audio to object storage so it can be played back later
     orig_name = file.filename or "audio.wav"
     ext = (Path(orig_name).suffix or ".wav").lower()
     audio_filename = f"{aid}{ext}"
     audio_mime = file.content_type or "audio/wav"
+    audio_storage_path = None
     try:
-        with open(UPLOAD_DIR / audio_filename, "wb") as fout:
-            fout.write(content)
+        audio_storage_path = put_object(
+            f"{APP_NAME}/uploads/{user['id']}/{audio_filename}", content, audio_mime
+        )["path"]
     except Exception:
-        logger.exception("Failed to persist audio file")
+        logger.exception("Failed to persist audio to object storage")
         audio_filename = None
 
     doc = {
@@ -621,6 +662,7 @@ async def create_analysis(
         "corrected_transcript": correction["corrected_transcript"],
         "pronunciation_tips": correction["pronunciation_tips"],
         "audio_filename": audio_filename,
+        "audio_storage_path": audio_storage_path,
         "audio_mime": audio_mime,
         **features,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -703,6 +745,14 @@ async def get_analysis_audio(
         raise HTTPException(status_code=404, detail="Analisis tidak ditemukan")
     if user["role"] == "siswa" and doc["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Forbidden")
+    spath = doc.get("audio_storage_path")
+    if spath:
+        try:
+            data, ctype = get_object(spath)
+        except Exception:
+            raise HTTPException(status_code=404, detail="File audio hilang")
+        return Response(content=data, media_type=doc.get("audio_mime") or ctype or "audio/mpeg")
+    # Legacy fallback for files stored on local disk before object storage
     fname = doc.get("audio_filename")
     if not fname:
         raise HTTPException(status_code=404, detail="Audio tidak tersedia")
@@ -792,6 +842,11 @@ async def root():
 
 @app.on_event("startup")
 async def seed_data():
+    try:
+        init_storage()
+        logger.info("Object storage initialized")
+    except Exception as e:
+        logger.error("Object storage init failed: %s", e)
     # Seed materials
     if await db.materials.count_documents({}) == 0:
         materials = [
